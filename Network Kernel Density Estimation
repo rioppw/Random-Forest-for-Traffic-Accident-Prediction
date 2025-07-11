@@ -1,0 +1,198 @@
+from IPython.display import HTML
+
+HTML('''
+<script>
+function ClickConnect(){
+    console.log("Clicking to prevent disconnect");
+    document.querySelector("colab-connect-button").click()
+}
+setInterval(ClickConnect, 60000)
+</script>
+''')
+# STEP 1: Install R and rpy2
+!apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+!sudo apt-get install -y r-base
+!pip install -q rpy2
+# STEP 2: Activate R magic
+%load_ext rpy2.ipython
+# STEP 3: Mount Google Drive (Python-side)
+from google.colab import drive
+drive.mount('/content/drive')
+%%R
+# STEP 4: Install R packages (run once only)
+install.packages("sf")
+install.packages("spNetwork")
+install.packages("tidyverse")
+install.packages("googledrive")
+%%R
+# STEP 5: Load libraries
+library(sf)
+library(spNetwork)
+library(tidyverse)
+library(googledrive)
+%%R
+## STEP 6: INPUTING SPATIAL DATA
+plots_road <- st_read("/content/drive/MyDrive/TA/Road_AK.shp")
+midpoints <- st_read("/content/drive/MyDrive/TA/midpoint_ak.shp")
+%%R
+# STEP 7: Check the column names of data frame
+print(names(plots_road))
+%%R
+# STEP 8: Validasi Geometri & Kolom Bobot
+jalan <- st_make_valid(plots_road)
+jalan <- st_cast(plots_road, "LINESTRING")
+%%R
+# STEP 9: Make sure column Real is numeric
+midpoints$Real <- as.numeric(midpoints$Real)
+%%R
+## STEP 10: SIMPLIFY LINE
+simple_lines <- sf::st_cast(plots_road, "LINESTRING")
+%%R
+## STEP 11: MAKING VALID GEOMETRY
+simple_lines_simplified <- st_simplify(simple_lines, dTolerance = 0.05)
+simple_lines_valid <- st_make_valid(simple_lines_simplified)
+%%R
+## STEP 12: SPLITTING LINE AS LIXELS
+lixels <- lixelize_lines(simple_lines_valid, 200, 100)
+%%R
+## STEP 13: EXTRACTING THE CENTER OF LIXELS AS SAMPLING POINTS
+sample_pts <- lines_center(lixels)
+%%R
+# cek shapefile terbaca
+print(plots_road)
+
+# cek kolom Real
+str(midpoints$Real)
+
+# cek validasi
+print(simple_lines_valid)
+
+# cek sampling point
+print(sample_pts)
+%%R
+# Pastikan CRS sama untuk semua objek spasial
+simple_lines_valid <- st_transform(simple_lines_valid, st_crs(midpoints))
+sample_pts <- st_transform(sample_pts, st_crs(midpoints))
+%%R
+# Bandwidth
+bw_used <- 2700
+
+# Buat bobot dummy (sementara) 1 untuk tiap titik
+weights <- rep(1, nrow(midpoints))
+
+# Cek objek
+print(is.null(simple_lines_valid))
+print(class(simple_lines_valid))
+
+print(is.null(sample_pts))
+print(class(sample_pts))
+
+# NKDE SIMPLE
+if (file.exists("/content/drive/MyDrive/nkde_simple.rds")) {
+  cat("nkde_simple already exists, skipping...\n")
+  nkde_simple <- readRDS("/content/drive/MyDrive/nkde_simple.rds")
+} else {
+  cat("Running nkde_simple...\n")
+nkde_simple <- nkde(
+  lines = simple_lines_valid,
+  events = midpoints,
+  w = weights,
+  samples = sample_pts,
+  kernel_name = "quartic",
+  bw = bw_used,
+  method = "simple",
+  div = "bw",
+  digits = 3,
+  agg = 1,
+  grid_shape = c(100, 100),
+  verbose = TRUE
+)
+saveRDS(nkde_simple, "/content/drive/MyDrive/nkde_simple.rds")}
+%%R
+# NKDE CONTINUOUS
+if (file.exists("/content/drive/MyDrive/nkde_continuous.rds")) {
+  cat("nkde_continuous already exists, skipping...\n")
+  nkde_continuous <- readRDS("/content/drive/MyDrive/nkde_continuous.rds")
+} else {
+  cat("Running nkde_continuous...\n")
+  nkde_continuous <- nkde(
+    lines = simple_lines_valid,
+    events = midpoints,
+    w = weights,
+    samples = sample_pts,
+    kernel_name = "quartic",
+    bw = bw_used,
+    method = "continuous",
+    div = "bw",
+    digits = 3,
+    agg = 1,
+    grid_shape = c(100, 100),
+    verbose = TRUE
+  )
+  saveRDS(nkde_continuous, "/content/drive/MyDrive/nkde_continuous.rds")}
+%%R
+# NKDE DISCONTINUOUS
+if (file.exists("/content/drive/MyDrive/nkde_discontinuous.rds")) {
+  cat("nkde_discontinuous already exists, skipping...\n")
+  nkde_discontinuous <- readRDS("/content/drive/MyDrive/nkde_discontinuous.rds")
+} else {
+  cat("Running nkde_discontinuous...\n")
+nkde_discontinuous <- nkde(
+  lines = simple_lines_valid,
+  events = midpoints,
+  w = weights,
+  samples = sample_pts,
+  kernel_name = "quartic",
+  bw = bw_used,
+  method = "discontinuous",
+  div = "bw",
+  digits = 3,
+  agg = 1,
+  grid_shape = c(100, 100),
+  verbose = TRUE
+)
+saveRDS(nkde_discontinuous, "/content/drive/MyDrive/nkde_discontinuous.rds")}
+%%R
+# STEP 4: TAMBAHKAN KE LIXEL DATA
+# Total kejadian = jumlah total Real
+# Handle missing values with na.rm = TRUE (R syntax)
+total_accidents <- sum(midpoints$Real, na.rm = TRUE)
+
+lixels$simple_density <- nkde_simple * total_accidents * 1000
+lixels$continuous_density <- nkde_continuous * total_accidents * 1000
+lixels$discontinuous_density <- nkde_discontinuous * total_accidents * 1000
+%%R
+# Perbedaan antar metode
+lixels$difference1 <- lixels$simple_density - lixels$continuous_density
+lixels$difference2 <- lixels$continuous_density - lixels$discontinuous_density
+%%R
+# STEP 5: PLOT PERBANDINGAN
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+df <- st_drop_geometry(lixels)[c("simple_density", "continuous_density", "discontinuous_density")]
+df <- df[order(df$continuous_density), ]
+df$oid <- 1:nrow(df)
+
+pivot_cols <- names(df)[names(df) != "oid"]
+df2 <- pivot_longer(df, cols = all_of(pivot_cols))
+df2$name <- case_when(
+  df2$name == "simple_density" ~ "Simple NKDE",
+  df2$name == "continuous_density" ~ "Continuous NKDE",
+  df2$name == "discontinuous_density" ~ "Discontinuous NKDE"
+)
+
+ggplot(df2) +
+  geom_point(aes(x = oid, y = value, color = name), size = 0.2) +
+  ylab("Estimated densities (accidents/km)") +
+  scale_color_manual(values = c("Simple NKDE"="yellow",
+                                "Continuous NKDE"="red",
+                                "Discontinuous NKDE"="green")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.title = element_blank())
+%%R
+# STEP 6: EXPORT HASIL KE GEOJSON
+st_write(lixels, "/content/drive/MyDrive/TA/nkde_output_real.geojson")
